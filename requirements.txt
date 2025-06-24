@@ -1,0 +1,14 @@
+fastapi  
+google-generativeai  
+pillow  
+pydantic  
+pytesseract  
+python-docx  
+python-dotenv  
+python-multipart  
+python-pptx  
+pypdf2  
+scipy  
+sounddevice  
+speechrecognition  
+uvicorn  
