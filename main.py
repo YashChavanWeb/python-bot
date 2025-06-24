@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 import os
@@ -10,17 +10,14 @@ from PIL import Image
 import pytesseract
 import io
 import re
-import json
-from datetime import datetime
-
-# import speech_recognition as sr # Commented out due to deployment challenges with audio recording
-from pydantic import BaseModel
 
 # ==== Gemini Config ====
-# It's highly recommended to use environment variables for API keys in production
-API_KEY = os.getenv(
-    "GEMINI_API_KEY", "AIzaSyA58up6mb0EppG3dI0lT2WYct4Om9aEQKw"
-)  # Use os.getenv for API key
+# IMPORTANT: Never hardcode API keys in production. Use environment variables.
+# For Render, you'll set this in the "Environment" section of your service.
+API_KEY = os.getenv("AIzaSyA58up6mb0EppG3dI0lT2WYct4Om9aEQKw")
+if not API_KEY:
+    raise ValueError("GEMINI_API_KEY environment variable not set.")
+
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel(
     "gemini-2.0-flash",
@@ -30,46 +27,20 @@ model = genai.GenerativeModel(
 # ==== FastAPI App ====
 app = FastAPI()
 
-# CORS configuration
-origins = [
-    "http://localhost",
-    "http://localhost:8000",
-    "http://localhost:5173",
-    "https://python-bot-bw2k.onrender.com",  # Add your Render frontend URL if it's different or for direct access
-    # You might want to remove "*" in production for security
-    "*",  # Keep for development ease, but be mindful for production
-]
-
+# Enable CORS for frontend calls
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "*"
+    ],  # Allows all origins, adjust in production for specific domains
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Allows all HTTP methods
+    allow_headers=["*"],  # Allows all headers
 )
 
-# Global state
+# Session state (for a single instance, not truly scalable for multiple users without a database)
 chat_history = []
 document_context = ""
-
-# Directories (might not be needed if not saving audio files on server)
-# AUDIO_DIR = "audio_files"
-# OUTPUT_DIR = "outputs"
-# AUDIO_FILENAME = "audio.wav"
-# JSON_FILENAME = "transcription.json"
-
-# os.makedirs(AUDIO_DIR, exist_ok=True) # Commented out
-# os.makedirs(OUTPUT_DIR, exist_ok=True) # Commented out
-
-# audio_path = os.path.join(AUDIO_DIR, AUDIO_FILENAME) # Commented out
-# json_path = os.path.join(OUTPUT_DIR, JSON_FILENAME) # Commented out
-
-
-# Pydantic model for response (commented out if audio recording is removed)
-# class TranscriptionResponse(BaseModel):
-#     timestamp: str
-#     audio_file: str
-#     transcription: str
 
 
 # ==== Document Handlers ====
@@ -99,6 +70,9 @@ def extract_text_from_pptx(file):
 
 def extract_text_from_image(file):
     img = Image.open(file)
+    # pytesseract needs Tesseract OCR engine installed on the system.
+    # For Render, you might need to use a custom Dockerfile or ensure Tesseract is available.
+    # A common approach is to use a pre-built Docker image that includes Tesseract.
     return pytesseract.image_to_string(img)
 
 
@@ -121,7 +95,9 @@ def get_text_from_file(uploaded_file: UploadFile):
         return "Unsupported document type"
 
 
-# ==== Gemini Logic ====
+# ==== Quizzy Bot Logic ====
+
+
 def generate_response(user_message, history):
     global document_context
     full_query = user_message
@@ -129,44 +105,60 @@ def generate_response(user_message, history):
         full_query = f"Based on the following document content:\n\n{document_context}\n\nAnd the user's query: {user_message}"
 
     try:
-        # Gemini API expects chat history in specific format
-        # Your current history is (human, ai) tuples. Let's convert it.
-        formatted_history = []
-        for human_msg, ai_msg in history:
-            formatted_history.append({"role": "user", "parts": [human_msg]})
-            formatted_history.append({"role": "model", "parts": [ai_msg]})
+        prompt_with_history = ""
+        for human, ai in history:
+            prompt_with_history += f"Human: {human}\nAI: {ai}\n"
+        prompt_with_history += f"Human: {full_query}\nAI:"
 
-        # Start a chat session with the model and provide the history
-        chat_session = model.start_chat(history=formatted_history)
-        response = chat_session.send_message(full_query)
+        # Sending the prompt to Gemini for processing
+        response = model.generate_content(prompt_with_history)
         bot_response = response.text.strip()
 
-        return format_bot_response(bot_response)
+        # Format the bot response (add some basic HTML structure for clarity)
+        structured_response = format_bot_response(bot_response)
+
+        history.append((user_message, structured_response))
+        return structured_response
 
     except Exception as e:
-        print(f"Error during Gemini API call: {e}")  # Log the actual error
-        return f"An error occurred with the AI model: {e}. Please try again or rephrase your query."
+        return f"An error occurred: {e}. Please try again or rephrase your query."
 
 
 def format_bot_response(response: str) -> str:
+    """
+    Formats the Gemini response by:
+    - Removing markdown and HTML
+    - Ensuring clear line breaks between bullet/numbered points
+    - Fixing special characters like \&
+    - Maintaining clean, readable spacing
+    """
+    # Remove markdown formatting
     cleaned_response = re.sub(r"\*\*(.*?)\*\*", r"\1", response)
     cleaned_response = re.sub(r"\*(.*?)\*", r"\1", cleaned_response)
+
+    # Remove HTML tags and replace <br> with line breaks
     cleaned_response = cleaned_response.replace("<br>", "\n")
     cleaned_response = re.sub(r"<[^>]+>", "", cleaned_response)
+
+    # Fix encoded characters
     cleaned_response = cleaned_response.replace("\\&", "&").replace("&nbsp;", " ")
-    cleaned_response = re.sub(r"(?<=\d\.)\s*", " ", cleaned_response)
-    cleaned_response = re.sub(r"\n(?=\d\.)", "\n\n", cleaned_response)
-    cleaned_response = re.sub(r"\n(?=- )", "\n\n", cleaned_response)
+
+    # Add line breaks between numbered or bullet items if not already present
+    cleaned_response = re.sub(r"(?<=\d\.)\s*", " ", cleaned_response)  # e.g. 1. Text
+    cleaned_response = re.sub(
+        r"\n(?=\d\.)", "\n\n", cleaned_response
+    )  # Ensure spacing before numbers
+    cleaned_response = re.sub(
+        r"\n(?=- )", "\n\n", cleaned_response
+    )  # Ensure spacing before bullets
+
+    # Normalize multiple newlines
     cleaned_response = re.sub(r"\n{2,}", "\n\n", cleaned_response).strip()
+
     return cleaned_response
 
 
-# ==== Endpoints ====
-
-
-@app.get("/")
-async def read_root():
-    return {"message": "QuizzyBot API is running!"}
+# ==== API Endpoints ====
 
 
 @app.post("/upload")
@@ -174,17 +166,13 @@ async def upload_document(file: UploadFile = File(...)):
     global document_context
     try:
         document_context = get_text_from_file(file)
-        if document_context == "Unsupported document type":
-            raise HTTPException(status_code=400, detail="Unsupported document type")
+        # Provide a preview of the uploaded document (first 300 characters)
         return {
             "message": "Document uploaded successfully.",
             "preview": document_context[:300],
         }
     except Exception as e:
-        print(f"Error uploading document: {str(e)}")
-        raise HTTPException(
-            status_code=500, detail=f"Error uploading document: {str(e)}"
-        )
+        return {"error": f"Error uploading document: {str(e)}"}
 
 
 @app.post("/chat")
@@ -199,13 +187,12 @@ async def chat(message: str = Form(...)):
     try:
         response = generate_response(query, chat_history)
         if not response:
-            raise HTTPException(status_code=500, detail="Empty response from Gemini.")
+            return {"error": "Empty response from Gemini."}
 
         chat_history.append((message, response))
         return {"response": response}
     except Exception as e:
-        print(f"Gemini API error in /chat: {str(e)}")  # Log the error for debugging
-        raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
+        return {"error": f"Gemini API error: {str(e)}"}
 
 
 @app.post("/clear")
@@ -214,23 +201,3 @@ async def clear():
     chat_history = []
     document_context = ""
     return {"message": "Context and chat history cleared."}
-
-
-# @app.post("/record_audio", response_model=TranscriptionResponse)
-# async def record_audio():
-#     # This endpoint is commented out because sounddevice and speech_recognition
-#     # often cause issues in serverless or containerized environments like Render.
-#     # If you need audio transcription, consider recording audio in the frontend
-#     # and sending it as a file to a new backend endpoint for transcription.
-#     return HTTPException(status_code=501, detail="Audio recording is not supported on this server.")
-
-# To run the app with Uvicorn, you need to use a __main__ block
-# This is crucial for Render to pick up your application
-if __name__ == "__main__":
-    import uvicorn
-
-    # Get the port from the environment variable, default to 8000 for local development
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(
-        "main:app", host="0.0.0.0", port=port, reload=True
-    )  # Assuming your file is named main.py
