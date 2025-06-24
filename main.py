@@ -11,10 +11,7 @@ import pytesseract
 import io
 import re
 
-# ==== Gemini Config ====
-# IMPORTANT: Never hardcode API keys in production. Use environment variables.
-# For Render, you'll set this in the "Environment" section of your service.
-API_KEY = os.getenv("AIzaSyA58up6mb0EppG3dI0lT2WYct4Om9aEQKw")
+API_KEY = os.getenv("GEMINI_API_KEY")
 if not API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable not set.")
 
