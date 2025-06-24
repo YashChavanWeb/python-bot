@@ -7,9 +7,9 @@ python-docx
 python-dotenv  
 python-multipart  
 python-pptx  
-pypdf2 
-protobuf>=5.29.5 
+pypdf2  
+protobuf>=5.29.5,<6.0.0  
 scipy  
 sounddevice  
-speech recognition  
-uvicorn  
+SpeechRecognition  
+uvicorn
