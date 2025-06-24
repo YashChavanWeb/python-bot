@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 import os
@@ -12,11 +12,15 @@ import io
 import re
 import json
 from datetime import datetime
-import speech_recognition as sr
+
+# import speech_recognition as sr # Commented out due to deployment challenges with audio recording
 from pydantic import BaseModel
 
 # ==== Gemini Config ====
-API_KEY = "AIzaSyA58up6mb0EppG3dI0lT2WYct4Om9aEQKw"
+# It's highly recommended to use environment variables for API keys in production
+API_KEY = os.getenv(
+    "GEMINI_API_KEY", "AIzaSyA58up6mb0EppG3dI0lT2WYct4Om9aEQKw"
+)  # Use os.getenv for API key
 genai.configure(api_key=API_KEY)
 model = genai.GenerativeModel(
     "gemini-2.0-flash",
@@ -31,7 +35,9 @@ origins = [
     "http://localhost",
     "http://localhost:8000",
     "http://localhost:5173",
-    "*",  # Allow all origins for development
+    "https://python-bot-bw2k.onrender.com",  # Add your Render frontend URL if it's different or for direct access
+    # You might want to remove "*" in production for security
+    "*",  # Keep for development ease, but be mindful for production
 ]
 
 app.add_middleware(
@@ -46,24 +52,24 @@ app.add_middleware(
 chat_history = []
 document_context = ""
 
-# Directories
-AUDIO_DIR = "audio_files"
-OUTPUT_DIR = "outputs"
-AUDIO_FILENAME = "audio.wav"
-JSON_FILENAME = "transcription.json"
+# Directories (might not be needed if not saving audio files on server)
+# AUDIO_DIR = "audio_files"
+# OUTPUT_DIR = "outputs"
+# AUDIO_FILENAME = "audio.wav"
+# JSON_FILENAME = "transcription.json"
 
-os.makedirs(AUDIO_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# os.makedirs(AUDIO_DIR, exist_ok=True) # Commented out
+# os.makedirs(OUTPUT_DIR, exist_ok=True) # Commented out
 
-audio_path = os.path.join(AUDIO_DIR, AUDIO_FILENAME)
-json_path = os.path.join(OUTPUT_DIR, JSON_FILENAME)
+# audio_path = os.path.join(AUDIO_DIR, AUDIO_FILENAME) # Commented out
+# json_path = os.path.join(OUTPUT_DIR, JSON_FILENAME) # Commented out
 
 
-# Pydantic model for response
-class TranscriptionResponse(BaseModel):
-    timestamp: str
-    audio_file: str
-    transcription: str
+# Pydantic model for response (commented out if audio recording is removed)
+# class TranscriptionResponse(BaseModel):
+#     timestamp: str
+#     audio_file: str
+#     transcription: str
 
 
 # ==== Document Handlers ====
@@ -123,18 +129,23 @@ def generate_response(user_message, history):
         full_query = f"Based on the following document content:\n\n{document_context}\n\nAnd the user's query: {user_message}"
 
     try:
-        prompt_with_history = ""
-        for human, ai in history:
-            prompt_with_history += f"Human: {human}\nAI: {ai}\n"
-        prompt_with_history += f"Human: {full_query}\nAI:"
+        # Gemini API expects chat history in specific format
+        # Your current history is (human, ai) tuples. Let's convert it.
+        formatted_history = []
+        for human_msg, ai_msg in history:
+            formatted_history.append({"role": "user", "parts": [human_msg]})
+            formatted_history.append({"role": "model", "parts": [ai_msg]})
 
-        response = model.generate_content(prompt_with_history)
+        # Start a chat session with the model and provide the history
+        chat_session = model.start_chat(history=formatted_history)
+        response = chat_session.send_message(full_query)
         bot_response = response.text.strip()
 
         return format_bot_response(bot_response)
 
     except Exception as e:
-        return f"An error occurred: {e}. Please try again or rephrase your query."
+        print(f"Error during Gemini API call: {e}")  # Log the actual error
+        return f"An error occurred with the AI model: {e}. Please try again or rephrase your query."
 
 
 def format_bot_response(response: str) -> str:
@@ -153,17 +164,27 @@ def format_bot_response(response: str) -> str:
 # ==== Endpoints ====
 
 
+@app.get("/")
+async def read_root():
+    return {"message": "QuizzyBot API is running!"}
+
+
 @app.post("/upload")
 async def upload_document(file: UploadFile = File(...)):
     global document_context
     try:
         document_context = get_text_from_file(file)
+        if document_context == "Unsupported document type":
+            raise HTTPException(status_code=400, detail="Unsupported document type")
         return {
             "message": "Document uploaded successfully.",
             "preview": document_context[:300],
         }
     except Exception as e:
-        return {"error": f"Error uploading document: {str(e)}"}
+        print(f"Error uploading document: {str(e)}")
+        raise HTTPException(
+            status_code=500, detail=f"Error uploading document: {str(e)}"
+        )
 
 
 @app.post("/chat")
@@ -178,12 +199,13 @@ async def chat(message: str = Form(...)):
     try:
         response = generate_response(query, chat_history)
         if not response:
-            return {"error": "Empty response from Gemini."}
+            raise HTTPException(status_code=500, detail="Empty response from Gemini.")
 
         chat_history.append((message, response))
         return {"response": response}
     except Exception as e:
-        return {"error": f"Gemini API error: {str(e)}"}
+        print(f"Gemini API error in /chat: {str(e)}")  # Log the error for debugging
+        raise HTTPException(status_code=500, detail=f"Gemini API error: {str(e)}")
 
 
 @app.post("/clear")
@@ -194,56 +216,21 @@ async def clear():
     return {"message": "Context and chat history cleared."}
 
 
-@app.post("/record_audio", response_model=TranscriptionResponse)
-async def record_audio():
-    try:
-        import sounddevice as sd
-        from scipy.io.wavfile import write
-    except ImportError as e:
-        return {"error": "Audio recording dependencies are missing: " + str(e)}
-    except OSError as e:
-        return {"error": "Audio hardware or PortAudio library issue: " + str(e)}
+# @app.post("/record_audio", response_model=TranscriptionResponse)
+# async def record_audio():
+#     # This endpoint is commented out because sounddevice and speech_recognition
+#     # often cause issues in serverless or containerized environments like Render.
+#     # If you need audio transcription, consider recording audio in the frontend
+#     # and sending it as a file to a new backend endpoint for transcription.
+#     return HTTPException(status_code=501, detail="Audio recording is not supported on this server.")
 
-    DURATION = 10
-    SAMPLE_RATE = 44100
+# To run the app with Uvicorn, you need to use a __main__ block
+# This is crucial for Render to pick up your application
+if __name__ == "__main__":
+    import uvicorn
 
-    try:
-        print(f"\nRecording for {DURATION} seconds... Speak now!")
-        audio_data = sd.rec(
-            int(DURATION * SAMPLE_RATE),
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype="int16",
-        )
-        sd.wait()
-
-        write(audio_path, SAMPLE_RATE, audio_data)
-        print(f"Audio saved to: {audio_path}")
-    except Exception as e:
-        return {"error": "Failed during audio recording: " + str(e)}
-
-    recognizer = sr.Recognizer()
-    with sr.AudioFile(audio_path) as source:
-        recorded_audio = recognizer.record(source)
-
-    try:
-        text = recognizer.recognize_google(recorded_audio)
-        print("Transcribed Text:", text)
-    except sr.UnknownValueError:
-        text = "[Unrecognized speech]"
-        print("Could not understand the audio.")
-    except sr.RequestError:
-        text = "[Google API unavailable]"
-        print("Could not request transcription from Google API.")
-
-    output = {
-        "timestamp": datetime.now().isoformat(),
-        "audio_file": audio_path,
-        "transcription": text,
-    }
-
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(output, f, indent=4)
-
-    print(f"Transcription saved to: {json_path}")
-    return TranscriptionResponse(**output)
+    # Get the port from the environment variable, default to 8000 for local development
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "main:app", host="0.0.0.0", port=port, reload=True
+    )  # Assuming your file is named main.py
